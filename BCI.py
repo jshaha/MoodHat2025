@@ -1,0 +1,593 @@
+import time
+import numpy as np
+from abc import ABC, abstractmethod
+import queue
+import threading
+from utils import generate_random_string, nanVal
+from scipy.integrate import simps
+import scipy.signal as signal
+import argparse
+from pythonosc import dispatcher as disp, osc_server
+import os
+import csv
+# import pylsl
+import mne
+
+class BCI:
+	'''
+		Class to manage collection of the BCI data and store into a buffer store. Used as the input of
+		the pipeline To receive data from the headset and store it into a list of storage queues for which
+		later blocks of the pipeline can pull from.. 
+		NOTE: This version is only set up for Muse S, using Petal Metrics' tool for handling the streaming protocol.
+		The current version works with OSC, LSL streaming is a TODO.
+
+		Class Variable:
+			- sampling_rate: sampling rate of the device
+			- streaming_software: software used for heandling the streaming (Petals for Muse S) (TODO: make this an option arguments)
+			- streaming_protocol: streaming protocol used by headset
+			- channel_names: list of names of channels, used for labels
+			- no_of_channels: number of channels for the device. Channels are defined as an independent stream of data that most processing blocks will treat as independent streams to compute the same operations on in parallel
+			- store: a list of queues where input data from the datastreams are added to, which later blocks can get() from
+			- time_store: single queue that holds timestamp data # TODO: make this function
+			- launch_server: function to initialize and start streaming data into self.store, determined by self.streaming_protocol
+
+	'''
+	def __init__(self, BCI_name="MuseS", BCI_params={}):
+		self.name = BCI_name
+		if self.name == "MuseS":
+			self.BCI_params = {"sampling_rate": 256, "channel_names":["TP9", "AF7", "AF8", "TP10"], "streaming_software":"Petals", "streaming_protocol":"OSC", "cache_size":256*30}
+			if BCI_params:
+				for i,j in BCI_params:
+					self.BCI_params[i] = j
+		else:
+			raise Exception("Unsupported BCI board") # change this when adding other headsets
+		
+		self.sampling_rate = self.BCI_params["sampling_rate"]
+		self.streaming_software = self.BCI_params["streaming_software"] # # TODO: add as optional argument
+		self.streaming_protocol = self.BCI_params["streaming_protocol"] # TODO: mandatory argument, add error handling
+		self.channel_names = self.BCI_params["channel_names"] # TODO: add error handling -> warning for non standard channel names
+		self.no_of_channels = len(self.channel_names) # TODO: add error handling
+		self.store = [queue.Queue() for i in range(self.no_of_channels)]
+		self.time_store = queue.Queue()
+		if self.streaming_protocol == 'LSL':
+			self.launch_server = self.launch_server_lsl
+		elif self.streaming_protocol == 'OSC':
+			self.launch_server = self.launch_server_osc
+		
+
+	def action(self):
+		pass # not required for BCI object
+
+	def handle_osc_message(self, address, *args):
+		'''
+		Receives messages through the OSC channel and adds them to a list of queues.
+		''' 
+		self.store[0].put(args[5])
+		self.store[1].put(args[6])
+		self.store[2].put(args[7])
+		self.store[3].put(args[8])
+		self.time_store.put(args[3] + args[4])
+
+	def launch_server_osc(self):
+		parser = argparse.ArgumentParser()
+		parser.add_argument('-i', '--ip', type=str, required=False,
+							default="127.0.0.1", help="The ip to listen on")
+		parser.add_argument('-p', '--udp_port', type=str, required=False, default=14739,
+							help="The UDP port to listen on")
+		parser.add_argument('-t', '--topic', type=str, required=False,
+							default='/PetalStream/eeg', help="The topic to print")
+		args = parser.parse_args()
+
+		dispatcher = disp.Dispatcher()
+		dispatcher.map(args.topic, self.handle_osc_message)
+
+		server = osc_server.ThreadingOSCUDPServer((args.ip, args.udp_port), dispatcher)
+		server_thread = threading.Thread(target=server.serve_forever)
+		server_thread.daemon = True
+		server_thread.start()
+
+		return server, server_thread
+	
+	# def launch_server_lsl(self):
+	# 	'''
+	# 	Receives messages through the OSC channel and adds them to a list of queues.
+	# 	TODO: broken, requires fixing.
+	# 	''' 
+	# 	# TODO: take code from Petal metrics and implement streaming with LSL
+	# 	parser = argparse.ArgumentParser()
+	# 	parser.add_argument('-n', '--stream_name', type=str, required=True,
+	# 						default='PetalStream_eeg', help='the name of the LSL stream')
+	# 	args = parser.parse_args()
+	# 	print(f'looking for a stream with name {args.stream_name}...')
+	# 	streams = pylsl.resolve_stream('name', args.stream_name)
+	# 	if len(streams) == 0:
+	# 		raise RuntimeError(f'Found no LSL streams with name {args.stream_name}')
+	# 	inlet = pylsl.StreamInlet(streams[0])
+
+	# 	...
+
+
+class Pipe:
+    '''
+    Connects one or more ProcessingBlocks together. Creates a pipeline of reordering
+    and moving average filtering.
+    '''
+    def __init__(self, no_of_outputs, no_of_input_channels, input_store, time_store) -> None:
+        self.no_of_outputs = no_of_outputs
+        self.no_of_input_channels = no_of_input_channels
+        self.input_store = input_store
+        self.time_store = time_store
+        self.name = "PIPE_" + generate_random_string()
+        
+        # Create intermediate queues for the reordered data
+        self.reordered_store = [queue.Queue() for _ in range(no_of_input_channels)]
+        self.reordered_time_store = queue.Queue()
+        
+        # Create output queues for filtered data
+        self.store = [[queue.Queue() for j in range(no_of_input_channels)] for i in range(no_of_outputs)]
+        
+        # Create the processing blocks
+        self.reorder_block = ReorderingBlock(
+            no_of_input_channels=self.no_of_input_channels, 
+            input_store=self.input_store,
+            time_store=self.time_store,
+            buffer_size=15
+        )
+        
+        self.moving_avg = MovingAverageFilter(
+            no_of_input_channels=self.no_of_input_channels, 
+            input_store=self.reorder_block.store,  # Connect to reorder block's output
+            window_size=8
+        )
+        self.notch_filter = NotchFilter(
+              no_of_input_channels=self.no_of_input_channels,
+                input_store=self.moving_avg.input_store,
+				notch_frequency=60,
+				sampling_frequency=500,
+				quality_factor=30 )
+        
+        self.psd_processor = PSDProcessor(
+            no_of_input_channels=self.no_of_input_channels,
+            sampling_frequency=500,  # Match your actual sampling rate
+            window_size=1024,        # Adjust as needed for frequency resolution
+            input_store=self.notch_filter.store,  # Process after notch filtering
+            overlap=0.75             # 75% overlap for smoother updates
+        )
+        
+    def action(self):
+        '''
+        Forward data from the moving average filter to all output queues
+        '''
+        while True:
+            try:
+                # For each channel, forward data from moving average to all outputs
+                for j in range(self.no_of_input_channels):
+                    print()
+                    value = self.notch_filter.store[j].get()
+                    
+                    for i in range(self.no_of_outputs):
+                        self.store[i][j].put(value)
+            except KeyboardInterrupt:
+                print(f"Closing {self.name} thread...")
+                break
+
+    def launch_server(self):
+        # Start the reordering block
+        self.reorder_block.launch_server()
+        print(f"{self.reorder_block.name} thread started...")
+        
+        # Start the moving average filter
+        self.moving_avg.launch_server()
+        print(f"{self.moving_avg.name} thread started...") 
+        
+        # Start notch filter
+        self.notch_filter.launch_server()
+        print(f"{self.notch_filter.name} thread started...")
+        
+        self.psd_processor.launch_server()
+        print(f"{self.psd_processor.name} thread started...")
+
+        # Start the pipe's own thread to forward output
+        pipe_thread = threading.Thread(target=self.action)
+        pipe_thread.daemon = True
+        pipe_thread.start()
+        print(f"{self.name} thread started...")
+        
+
+	# TODO: add functionality to stop the pipe if any output is not ready for loading yet
+
+class ProcessingBlock(ABC):
+	'''
+	Abstract class for processing block. Should have an _init_ function, an action function, a process function to start the processing thread
+	'''
+	# def __init__(self, cache_dim=(256*5)):
+		# self.input_queue = input_queue # reference to queue to pool data from into own cache
+		# self.output_queue = output_queue 
+
+	@abstractmethod
+	def __init__():
+		pass
+
+	def launch_server(self):
+		average_thread = threading.Thread(target=self.action)
+		average_thread.daemon = True
+		average_thread.start()
+		print(f"{self.name} thread started...")
+	
+	def action(self):
+		pass
+
+
+
+class ReorderingBlock(ProcessingBlock):
+    """
+    Reorders incoming EEG samples based on their timestamps.
+    Adapted to work with the Pipe system where timestamps and channel data
+    come from separate queues.
+    """
+    
+    def __init__(self, no_of_input_channels, input_store, time_store, buffer_size=15):
+        self.no_of_input_channels = no_of_input_channels
+        self.input_store = input_store  # List of queues, one per channel
+        self.time_store = time_store    # Queue of timestamps
+        self.buffer_size = buffer_size
+        self.name = "SampleReorder_" + generate_random_string()
+        
+        # Create output queues for reordered data
+        self.store = [queue.Queue() for _ in range(self.no_of_input_channels)]
+        self.reordered_time_store = queue.Queue()
+        
+        # Buffer for collecting samples before reordering
+        self.buffer = []
+        
+        # For monitoring
+        self.samples_processed = 0
+        
+    def action(self):
+        """Process and reorder samples based on timestamps."""
+        while True:
+            try:
+                # Collect buffer_size samples
+                while len(self.buffer) < self.buffer_size:
+                    # Get timestamp
+                    timestamp = self.time_store.get(timeout=1.0)
+                    
+                    # Get one sample from each channel
+                    channel_data = []
+                    for i in range(self.no_of_input_channels):
+                        channel_data.append(self.input_store[i].get(timeout=1.0))
+                    
+                    # Store sample with timestamp as sorting key
+                    self.buffer.append((timestamp, channel_data))
+                
+                # Sort the buffer by timestamp
+                self.buffer.sort(key=lambda x: x[0])
+                
+                # Output reordered samples
+                for timestamp, channel_data in self.buffer:
+                    # Put timestamp in time store
+                    self.reordered_time_store.put(timestamp)
+                    
+                    # Put channel data in respective output queues
+                    for i in range(self.no_of_input_channels):
+                        self.store[i].put(channel_data[i])
+                    
+                    self.samples_processed += 1
+                
+                # Clear the buffer for the next batch
+                self.buffer = []
+                
+                # Periodically log stats
+                if self.samples_processed % 1000 == 0:
+                    print(f"{self.name}: Processed {self.samples_processed} samples")
+                    
+            except queue.Empty:
+                # No data available, sleep briefly
+                time.sleep(0.01)
+            except Exception as e:
+                print(f"Error in {self.name}: {e}")
+                time.sleep(0.1)
+class MovingAverageFilter(ProcessingBlock):
+    """
+    Calculates moving average for each channel independently.
+    Adapted to work with the Pipe system.
+    """
+    
+    def __init__(self, no_of_input_channels, input_store, window_size=8):
+        self.no_of_input_channels = no_of_input_channels
+        self.input_store = input_store  # List of queues, one per channel
+        self.window_size = window_size
+        self.name = "MovingAvg_" + generate_random_string()
+        
+        # Create output queues
+        self.store = [queue.Queue() for _ in range(self.no_of_input_channels)]
+        
+        # Initialize buffers for each channel
+        self.buffers = [[] for _ in range(self.no_of_input_channels)]
+        
+    def action(self):
+        """Process incoming data with a moving average filter."""
+        while True:
+            try:
+                # Process each channel independently
+                for channel_idx in range(self.no_of_input_channels):
+                    # Get new data point
+                    if not self.input_store[channel_idx].empty():
+                        value = self.input_store[channel_idx].get()
+                        
+                        # Add to buffer
+                        buffer = self.buffers[channel_idx]
+                        buffer.append(value)
+                        
+                        # If buffer is full, calculate average and output
+                        if len(buffer) >= self.window_size:
+                            # Calculate average
+                            average = sum(buffer) / self.window_size
+                            
+                            # Put the result in the output queue
+                            self.store[channel_idx].put(average)
+                            
+                            # Remove oldest value
+                            buffer.pop(0)
+                
+                # Small delay to prevent CPU hogging
+                time.sleep(0.001)
+                
+            except Exception as e:
+                print(f"Error in {self.name}: {e}")
+                time.sleep(0.1)
+
+
+class ArrayIntegrator(ProcessingBlock):
+	'''
+	Integrates the array for each channel and outputs a single value per channel. Does not integrate over time
+
+	Class Variables:
+	- no_of_input_channels: number of input channels
+	- x_axis_resolution: dx of the x-axis values, assumed uniform spacing
+	- no_of_inputs: number of input values (without regarding channel count)
+	- prior_valid: points to the validity of the prior block (need to be precomputed for validity of multiple inputs) (TODO: not implemented)
+	- array_of_inputs <-> *args : list of stores to input from to integrate
+	- name: name of block
+	- cache: temporary store (no_of_input_channels x no_of_inputs)
+	- store: output store (1 x no_of_input_channels)
+	- valid: validity of output (TODO: not implemented)
+	'''
+	def __init__(self, no_of_input_channels, x_axis_resolution, no_of_inputs, prior_valid, *args):
+		...
+
+
+
+class Ratio(ProcessingBlock):
+	'''
+	Calculates the ratio between two values over multiple channels. Outputs input1 / input2
+
+	Class variables:
+	- no_of_input_channels: number of channels in inputs (must be equal)
+	- input1: source for the numerator input
+	- input2: source for the denominator input
+	- store: queue for the output stream
+	- valid: indicator for valid input
+	'''
+	def __init__(self, no_of_input_channels, input_store1, input_store2, prior_valid1, prior_valid2):
+		self.no_of_input_channels = no_of_input_channels
+		self.input_store1 = input_store1
+		self.input_store2 = input_store2
+		self.prior_valid1 = prior_valid1
+		self.prior_valid2 = prior_valid2
+
+	def ratio(self):
+		if (self.prior_valid1 and self.prior_valid2):
+			return self.input_store1 / self.input_store2
+
+
+
+class NotchFilter(ProcessingBlock):
+    '''
+    Applies a Notch Filter on the data stream. Apply this on the input data 
+    (easiest to do this before applying any other processing blocks)
+    '''
+    def __init__(self, no_of_input_channels, input_store, notch_frequency, sampling_frequency, quality_factor):
+        self.no_of_input_channels = no_of_input_channels
+        self.input_store = input_store
+        self.notch_frequency = notch_frequency
+        self.sampling_frequency = sampling_frequency
+        self.quality_factor = quality_factor
+        
+        self.name = "NotchFilter_" + generate_random_string()
+        
+        # Output queue for each channel
+        self.store = [queue.Queue() for _ in range(self.no_of_input_channels)]
+        
+        # Buffer to accumulate data for filtering
+        self.buffer_size = 128  # Adjust based on your needs
+        self.buffers = [[] for _ in range(self.no_of_input_channels)]
+    
+    def action(self):
+        while True:
+            try:
+                # Process each channel
+                for j in range(self.no_of_input_channels): 
+                    # Get new data if available
+                    if not self.input_store[j].empty():
+                        print("putting into buffer")
+                        value = self.input_store[j].get()
+                        
+                        # Add to buffer
+                        self.buffers[j].append(value)
+                        
+                        # If buffer is full, apply notch filter
+                        if len(self.buffers[j]) >= self.buffer_size:
+                            print("full buffer")
+                            # Convert to numpy array for filtering
+                            data_array = np.array(self.buffers[j])
+                            
+                            # Apply notch filter
+                            filtered_data = mne.filter.notch_filter(
+                                data_array, 
+                                self.sampling_frequency, 
+                                self.notch_frequency,
+                                filter_length='auto', 
+                                notch_widths=None, 
+                                trans_bandwidth=1, 
+                                method='fir',
+                                phase='zero', 
+                                fir_window='hamming'
+                            )
+                            print("post notch")
+                            # Output the filtered value and remove oldest value
+                            self.store[j].put(filtered_data[-1])
+                            self.buffers[j].pop(0)
+                
+                # Small delay to prevent CPU hogging
+                time.sleep(0.001)
+                
+            except KeyboardInterrupt:
+                print(f"Closing {self.name} thread...")
+                break
+            except Exception as e:
+                print(f"Error in {self.name}: {e}")
+                time.sleep(0.1)
+
+
+class csvOutput:
+    '''
+    Takes incoming data and saves it into a CSV format.
+    '''
+    def __init__(self, num_input_channels, input_store, file_name="eeg_data.csv"):
+        self.num_input_channels = num_input_channels
+        self.input_store = input_store  
+        self.file_name = file_name
+        self.name = "CSV_Output"
+
+        # Remove old file if it exists
+        if os.path.exists(file_name):
+            os.remove(file_name)
+
+        # Create header
+        with open(self.file_name, 'w', newline='') as f:
+            writer = csv.writer(f)
+            header = [f"Channel_{i}" for i in range(self.num_input_channels)]
+            writer.writerow(header)
+
+
+    def action(self):
+        while True:
+            try:
+                # Get one sample from each channel
+                row = [self.input_store[i].get() for i in range(self.num_input_channels)]
+
+                # Append to CSV
+                with open(self.file_name, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(row)
+
+            except Exception as e:
+                print(f"[csvOutput] Error writing to CSV: {e}")
+
+class PSDProcessor(ProcessingBlock):
+    """
+    Calculates Power Spectral Density and band powers for each channel.
+    Works with continuous data flows from queues.
+    """
+    
+    def __init__(self, no_of_input_channels, sampling_frequency, window_size, input_store, overlap=0.5):
+        self.no_of_input_channels = no_of_input_channels
+        self.sampling_frequency = sampling_frequency
+        self.window_size = window_size
+        self.overlap = overlap
+        self.input_store = input_store
+        self.name = "PSD_" + generate_random_string()
+        
+        # Calculate step size based on overlap
+        self.step_size = int(self.window_size * (1 - self.overlap))
+        if self.step_size < 1:
+            self.step_size = 1
+            
+        # Define frequency bands of interest for emotion detection
+        self.bands = {
+            'delta': (1, 4),    # Deep sleep, unconsciousness
+            'theta': (4, 8),    # Drowsiness, meditation
+            'alpha': (8, 13),   # Relaxation, calmness
+            'beta': (13, 30),   # Active thinking, focus
+            'gamma': (30, 45)   # Higher processing
+        }
+        
+        # Create output queues - will contain tuples of (frequencies, psd_values)
+        self.psd_store = [queue.Queue() for _ in range(self.no_of_input_channels)]
+        
+        # Create output queue for band powers - will contain dictionaries
+        self.band_power_store = queue.Queue()
+        
+        # Initialize buffers for each channel
+        self.buffers = [[] for _ in range(self.no_of_input_channels)]
+        
+    def action(self):
+        """Process incoming data with Welch's method for PSD estimation."""
+        while True:
+            try:
+                # Dictionary to hold band powers for all channels
+                all_band_powers = {}
+                new_data_processed = False
+                
+                # Process each channel independently
+                for channel_idx in range(self.no_of_input_channels):
+                    # Get new data points until we have enough or queue is empty
+                    while (len(self.buffers[channel_idx]) < self.window_size and 
+                           not self.input_store[channel_idx].empty()):
+                        value = self.input_store[channel_idx].get()
+                        self.buffers[channel_idx].append(value)
+                    
+                    # If buffer has enough samples, calculate PSD
+                    if len(self.buffers[channel_idx]) >= self.window_size:
+                        # Get window of data
+                        data_window = np.array(self.buffers[channel_idx][:self.window_size])
+                        
+                        # Apply Hann window to reduce spectral leakage
+                        window = np.hanning(len(data_window))
+                        windowed_data = data_window * window
+                        
+                        # Calculate FFT
+                        fft_data = np.fft.rfft(windowed_data)
+                        
+                        # Calculate power (squared magnitude)
+                        psd_values = np.abs(fft_data) ** 2
+                        
+                        # Scale by window energy and sampling frequency
+                        scale = 1.0 / (self.sampling_frequency * np.sum(window**2))
+                        psd_values = psd_values * scale
+                        
+                        # Create frequency array
+                        freqs = np.fft.rfftfreq(len(data_window), 1.0/self.sampling_frequency)
+                        
+                        # Put the raw PSD result in its output queue
+                        self.psd_store[channel_idx].put((freqs, psd_values))
+                        
+                        # Calculate band powers
+                        for band_name, (fmin, fmax) in self.bands.items():
+                            # Find indices corresponding to frequency range
+                            idx_min = np.argmin(np.abs(freqs - fmin))
+                            idx_max = np.argmin(np.abs(freqs - fmax))
+                            
+                            # Calculate band power (area under the curve)
+                            power = simps(psd_values[idx_min:idx_max+1], 
+                                         freqs[idx_min:idx_max+1])
+                            
+                            # Store with channel and band in the name
+                            feature_name = f"channel_{channel_idx}_{band_name}"
+                            all_band_powers[feature_name] = power
+                        
+                        # Remove oldest samples based on step size
+                        self.buffers[channel_idx] = self.buffers[channel_idx][self.step_size:]
+                        new_data_processed = True
+                
+                # If we have new data for any channel, output the band powers
+                if new_data_processed and all_band_powers:
+                    self.band_power_store.put(all_band_powers)
+                
+                # Small delay to prevent CPU hogging
+                time.sleep(0.01)
+                
+            except Exception as e:
+                print(f"Error in {self.name}: {e}")
+                time.sleep(0.1)
