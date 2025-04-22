@@ -410,7 +410,6 @@ class NotchFilter(ProcessingBlock):
                 for j in range(self.no_of_input_channels): 
                     # Get new data if available
                     if not self.input_store[j].empty():
-                        print("putting into buffer")
                         value = self.input_store[j].get()
                         
                         # Add to buffer
@@ -418,7 +417,6 @@ class NotchFilter(ProcessingBlock):
                         
                         # If buffer is full, apply notch filter
                         if len(self.buffers[j]) >= self.buffer_size:
-                            print("full buffer")
                             # Convert to numpy array for filtering
                             data_array = np.array(self.buffers[j])
                             
@@ -434,7 +432,6 @@ class NotchFilter(ProcessingBlock):
                                 phase='zero', 
                                 fir_window='hamming'
                             )
-                            print("post notch")
                             # Output the filtered value and remove oldest value
                             self.store[j].put(filtered_data[-1])
                             self.buffers[j].pop(0)

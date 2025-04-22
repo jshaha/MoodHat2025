@@ -10,94 +10,71 @@ import queue
 source = BCI("MuseS")
 server, serverThread = source.launch_server_osc()
 pipe = Pipe(1, len(source.BCI_params["channel_names"]), source.store, source.time_store)
-
-# Add debugging statements
-print(f"BCI initialized with {len(source.BCI_params['channel_names'])} channels")
-print(f"Channel names: {source.BCI_params['channel_names']}")
-
-# Launch the server - this should start all processing blocks
 pipe.launch_server()
-print("Pipe server launched")
 
-# Debug function to monitor data flow
-def debug_data_flow():
-    print("Starting debug monitoring...")
-    count = 0
-    while count < 100:  # Check for ~10 seconds
-        # Check if raw data is coming in
-        raw_data_available = sum([not q.empty() for q in source.store])
-        print(f"Raw data queues with data: {raw_data_available}/{len(source.store)}")
-        
-        # Check if data is flowing through pipe
-        pipe_data_available = sum([not q.empty() for q in pipe.store[0]])
-        print(f"Pipe output queues with data: {pipe_data_available}/{len(pipe.store[0])}")
-        
-        # Try to check PSD processor
+# Create figure for PSD visualization
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.set_title('Real-Time EEG Power Spectral Density')
+ax.set_xlabel('Frequency (Hz)')
+ax.set_ylabel('Power (μV²/Hz)')
+ax.set_xlim(0, 60)  # Display frequencies up to 60 Hz
+ax.set_ylim(0, 200)  # Adjust based on your data
+ax.grid(True)
+
+# Initialize lines for each channel
+channel_colors = ['purple', 'blue', 'green', 'orange']
+lines = []
+for i in range(len(source.BCI_params["channel_names"])):
+    line, = ax.plot([], [], color=channel_colors[i], 
+                   label=f'Channel {source.BCI_params["channel_names"][i]}')
+    lines.append(line)
+ax.legend()
+
+# Create a queue to store PSD data from the processing thread
+psd_queue = queue.Queue()
+
+# Process data and calculate PSD
+def process_psd():
+    # This will loop continuously, calculating PSD and putting results in the queue
+    while True:
         try:
-            psd_data_available = hasattr(pipe, 'psd_processor') and \
-                                hasattr(pipe.psd_processor, 'psd_store') and \
-                                sum([not q.empty() for q in pipe.psd_processor.psd_store])
-            print(f"PSD queues with data: {psd_data_available}")
-        except Exception as e:
-            print(f"Error checking PSD processor: {e}")
-        
-        count += 1
-        time.sleep(0.1)
-    
-    print("Debug monitoring complete")
-
-# Run debugging in a thread
-debug_thread = threading.Thread(target=debug_data_flow)
-debug_thread.start()
-
-# Simple PSD monitoring function
-def monitor_psd():
-    print("Waiting for PSD data...")
-    start_time = time.time()
-    
-    while time.time() - start_time < 30:  # Wait up to 30 seconds
-        try:
-            if hasattr(pipe, 'psd_processor') and hasattr(pipe.psd_processor, 'psd_store'):
-                for ch in range(len(source.BCI_params["channel_names"])):
-                    queue_len = pipe.psd_processor.psd_store[ch].qsize() if not pipe.psd_processor.psd_store[ch].empty() else 0
-                    print(f"Channel {ch} PSD queue size: {queue_len}")
+            # Get the latest PSD data from your pipe
+            for ch in range(len(source.BCI_params["channel_names"])):
+                if not pipe.psd_processor.psd_store[ch].empty():
+                    print("were in")
+                    # Get PSD data (frequencies and power values)
+                    freqs, psd_values = pipe.psd_processor.psd_store[ch].get()
                     
-                    if not pipe.psd_processor.psd_store[ch].empty():
-                        # Try to get data
-                        try:
-                            # Use get_nowait to avoid blocking
-                            freqs, psd_values = pipe.psd_processor.psd_store[ch].get_nowait()
-                            print(f"Got PSD data for channel {ch}!")
-                            print(f"  Frequency range: {min(freqs)}-{max(freqs)} Hz")
-                            print(f"  Power range: {min(psd_values)}-{max(psd_values)}")
-                            
-                            # Plot a single PSD to verify data
-                            plt.figure(figsize=(10, 6))
-                            plt.plot(freqs, psd_values, label=f'Channel {ch} PSD')
-                            plt.xlabel('Frequency (Hz)')
-                            plt.ylabel('Power (μV²/Hz)')
-                            plt.title(f'PSD for Channel {ch}')
-                            plt.grid(True)
-                            plt.legend()
-                            plt.savefig(f'psd_ch{ch}.png')  # Save to file
-                            plt.close()
-                            
-                            print(f"Saved PSD plot for channel {ch} to psd_ch{ch}.png")
-                        except queue.Empty:
-                            print(f"Queue for channel {ch} was empty when trying to get data")
+                    # Put the data in our visualization queue
+                    psd_queue.put((ch, freqs, psd_values))
+            
+            # Sleep briefly to prevent CPU hogging
+            time.sleep(0.1)
+            
         except Exception as e:
-            print(f"Error in PSD monitoring: {e}")
-        
-        time.sleep(1)
-    
-    print("PSD monitoring complete")
+            print(f"Error in PSD processing: {e}")
+            time.sleep(0.5)
 
-# Run PSD monitoring in a thread
-psd_thread = threading.Thread(target=monitor_psd)
+# Animation update function
+def update(frame):
+    # Get all available PSD data
+    changed = False
+    while not psd_queue.empty():
+        ch, freqs, psd_values = psd_queue.get()
+        lines[ch].set_data(freqs, psd_values)
+        changed = True
+    
+    # If we got new data, adjust y-axis if needed
+    if changed:
+        ax.relim()
+        ax.autoscale_view(scalex=False)  # only autoscale y-axis
+    
+    return lines
+
+# Start PSD processing in a separate thread
+psd_thread = threading.Thread(target=process_psd, daemon=True)
 psd_thread.start()
 
-# Wait for debug and monitoring to complete
-debug_thread.join()
-psd_thread.join()
-
-print("Debug complete - check the output to diagnose the issue")
+# Start animation
+ani = animation.FuncAnimation(fig, update, interval=100, blit=False)
+plt.show()
