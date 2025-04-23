@@ -39,6 +39,7 @@ def process_psd():
     while True:
         try:
             # Get the latest PSD data from your pipe
+            print("processing")
             for ch in range(len(source.BCI_params["channel_names"])):
                 if not pipe.psd_processor.psd_store[ch].empty():
                     print("were in")

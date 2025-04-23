@@ -141,7 +141,7 @@ class Pipe:
         )
         self.notch_filter = NotchFilter(
               no_of_input_channels=self.no_of_input_channels,
-                input_store=self.moving_avg.input_store,
+                input_store=self.moving_avg.store,
 				notch_frequency=60,
 				sampling_frequency=500,
 				quality_factor=30 )
@@ -149,7 +149,7 @@ class Pipe:
         self.psd_processor = PSDProcessor(
             no_of_input_channels=self.no_of_input_channels,
             sampling_frequency=500,  # Match your actual sampling rate
-            window_size=1024,        # Adjust as needed for frequency resolution
+            window_size=50,        # Adjust as needed for frequency resolution
             input_store=self.notch_filter.store,  # Process after notch filtering
             overlap=0.75             # 75% overlap for smoother updates
         )
@@ -414,8 +414,7 @@ class NotchFilter(ProcessingBlock):
                         
                         # Add to buffer
                         self.buffers[j].append(value)
-                        
-                        # If buffer is full, apply notch filter
+                         # If buffer is full, apply notch filter
                         if len(self.buffers[j]) >= self.buffer_size:
                             # Convert to numpy array for filtering
                             data_array = np.array(self.buffers[j])
@@ -445,7 +444,6 @@ class NotchFilter(ProcessingBlock):
             except Exception as e:
                 print(f"Error in {self.name}: {e}")
                 time.sleep(0.1)
-
 
 class csvOutput:
     '''
@@ -482,10 +480,12 @@ class csvOutput:
             except Exception as e:
                 print(f"[csvOutput] Error writing to CSV: {e}")
 
+
+
 class PSDProcessor(ProcessingBlock):
     """
     Calculates Power Spectral Density and band powers for each channel.
-    Works with continuous data flows from queues.
+    Works with continuous data flows from queues using SciPy's Welch method.
     """
     
     def __init__(self, no_of_input_channels, sampling_frequency, window_size, input_store, overlap=0.5):
@@ -520,7 +520,8 @@ class PSDProcessor(ProcessingBlock):
         self.buffers = [[] for _ in range(self.no_of_input_channels)]
         
     def action(self):
-        """Process incoming data with Welch's method for PSD estimation."""
+        """Process incoming data with Welch's method for PSD estimation using SciPy."""
+        print(f"{self.name} thread started...")
         while True:
             try:
                 # Dictionary to hold band powers for all channels
@@ -534,28 +535,21 @@ class PSDProcessor(ProcessingBlock):
                            not self.input_store[channel_idx].empty()):
                         value = self.input_store[channel_idx].get()
                         self.buffers[channel_idx].append(value)
-                    
+	
                     # If buffer has enough samples, calculate PSD
                     if len(self.buffers[channel_idx]) >= self.window_size:
                         # Get window of data
                         data_window = np.array(self.buffers[channel_idx][:self.window_size])
                         
-                        # Apply Hann window to reduce spectral leakage
-                        window = np.hanning(len(data_window))
-                        windowed_data = data_window * window
-                        
-                        # Calculate FFT
-                        fft_data = np.fft.rfft(windowed_data)
-                        
-                        # Calculate power (squared magnitude)
-                        psd_values = np.abs(fft_data) ** 2
-                        
-                        # Scale by window energy and sampling frequency
-                        scale = 1.0 / (self.sampling_frequency * np.sum(window**2))
-                        psd_values = psd_values * scale
-                        
-                        # Create frequency array
-                        freqs = np.fft.rfftfreq(len(data_window), 1.0/self.sampling_frequency)
+                        # Use scipy.signal.welch to calculate PSD
+                        freqs, psd_values = signal.welch(
+                            data_window, 
+                            fs=self.sampling_frequency,
+                            window='hann',
+                            nperseg=self.window_size,
+                            noverlap=int(self.window_size * self.overlap),
+                            scaling='density'
+                        )
                         
                         # Put the raw PSD result in its output queue
                         self.psd_store[channel_idx].put((freqs, psd_values))
@@ -563,12 +557,13 @@ class PSDProcessor(ProcessingBlock):
                         # Calculate band powers
                         for band_name, (fmin, fmax) in self.bands.items():
                             # Find indices corresponding to frequency range
-                            idx_min = np.argmin(np.abs(freqs - fmin))
-                            idx_max = np.argmin(np.abs(freqs - fmax))
+                            idx_band = np.logical_and(freqs >= fmin, freqs <= fmax)
                             
                             # Calculate band power (area under the curve)
-                            power = simps(psd_values[idx_min:idx_max+1], 
-                                         freqs[idx_min:idx_max+1])
+                            if np.any(idx_band):  # Only calculate if we have data in this range
+                                power = simps(psd_values[idx_band], freqs[idx_band])
+                            else:
+                                power = 0.0
                             
                             # Store with channel and band in the name
                             feature_name = f"channel_{channel_idx}_{band_name}"
@@ -587,4 +582,6 @@ class PSDProcessor(ProcessingBlock):
                 
             except Exception as e:
                 print(f"Error in {self.name}: {e}")
+                import traceback
+                traceback.print_exc()
                 time.sleep(0.1)
