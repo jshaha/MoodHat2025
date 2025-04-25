@@ -1,0 +1,138 @@
+import queue
+import threading
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import sys
+import time
+import numpy as np
+from pathlib import Path
+
+# Determine the directory containing the module
+relative_path = Path("../../BCI.py")
+module_directory = relative_path.parent.resolve()
+
+# Add the directory to sys.path
+sys.path.insert(0, str(module_directory))
+
+# Now you can import the module
+from BCI import *
+
+# Create artificial BCI with customized signal parameters
+artificial_params = {
+    "frequencies": [40.0, 60.0, 80.0, 100.0],  # Hz - different freq for each channel
+    "amplitudes": [50.0, 50.0, 50.0, 50.0],  # µV - different amplitude for each channel
+    "noise_level": 0.0,  # µV - background noise level
+    "dc_offset": [0.0, 0.0, 0.0, 0.0]  # DC offset for each channel
+}
+
+# Initialize headset with artificial signal generation
+headset = BCI("MuseS", is_artificial=True, artificial_signal_params=artificial_params)
+_, headset_server_thread = headset.launch_server()
+
+pipe_obj = Pipe(2, headset.no_of_channels, headset.store, headset.time_store)
+pipe_obj.launch_server()
+
+def store_empty(store_list):
+    return any([item.empty() for item in store_list])
+
+# Create newstore queues
+newstore = [queue.Queue() for _ in range(headset.no_of_channels)]
+
+# Function to continuously copy data from headset.store to newstore
+def data_copy_thread():
+    while True:
+        try:
+            # Check if all headset stores have data
+            if not store_empty(headset.store):
+                for j in range(headset.no_of_channels):
+                    # Use get_nowait to avoid blocking
+                    try:
+                        value = headset.store[j].get_nowait()
+                        newstore[j].put(value)
+                    except queue.Empty:
+                        # Skip if a queue is empty
+                        pass
+            # Small delay to prevent CPU overload
+            time.sleep(0.001)
+        except Exception as e:
+            print(f"Error in data copy thread: {e}")
+
+# Start the data copy thread
+copy_thread = threading.Thread(target=data_copy_thread, daemon=True)
+copy_thread.start()
+
+final_output_store = [newstore, pipe_obj.store[1]]
+number_of_plots = pipe_obj.no_of_outputs
+number_of_lines = pipe_obj.no_of_input_channels
+list_of_labels = headset.channel_names
+
+# Setup figure and subplots
+fig = plt.figure(figsize=(12, 6))
+ax1 = fig.add_subplot(1, 2, 1)
+ax1.set_title("Raw Signals")
+ax2 = fig.add_subplot(1, 2, 2)
+ax2.set_title("Processed Signals")
+axes_list = [ax1, ax2]
+
+# Fixed buffer size for the x-axis
+BUFFER_SIZE = 100  # Number of points to display at once
+
+# Initialize data arrays with fixed size
+xdata = [np.arange(BUFFER_SIZE) for _ in range(number_of_plots)]
+ydata_matrix = [[np.zeros(BUFFER_SIZE) for _ in range(number_of_lines)] for _ in range(number_of_plots)]
+plot_matrix = [[None for _ in range(number_of_lines)] for _ in range(number_of_plots)]
+
+# Initialize plots with labels
+for i in range(number_of_plots):
+    for j in range(number_of_lines):
+        a, = axes_list[i].plot([], [], label=list_of_labels[j])
+        plot_matrix[i][j] = a
+    axes_list[i].legend()
+    axes_list[i].set_xlim(0, BUFFER_SIZE)
+    axes_list[i].set_ylim(-500, 500)  # Adjust based on your signal amplitudes
+
+def init():
+    for i in range(number_of_plots):
+        for j in range(number_of_lines):
+            plot_matrix[i][j].set_data(xdata[i], ydata_matrix[i][j])
+    return [line for sublist in plot_matrix for line in sublist]
+
+def update(frame):
+    # For each plot (raw and processed)
+    for i in range(number_of_plots):
+        if not store_empty(final_output_store[i]):
+            # For each channel
+            for j in range(number_of_lines):
+                # Shift data to the left
+                ydata_matrix[i][j][:-1] = ydata_matrix[i][j][1:]
+                
+                # Add new data point at the end
+                try:
+                    new_value = final_output_store[i][j].get_nowait()
+                    ydata_matrix[i][j][-1] = new_value
+                except queue.Empty:
+                    # If queue is empty, just keep the last value
+                    pass
+                
+                # Update the plot
+                plot_matrix[i][j].set_data(xdata[i], ydata_matrix[i][j])
+    
+    return [line for sublist in plot_matrix for line in sublist]
+
+# Create animation - faster refresh rate for smoother display
+ani = animation.FuncAnimation(fig, update, init_func=init, interval=1, blit=True)
+
+plt.tight_layout()
+plt.show()
+
+try:
+    while True:
+        pass  # Keep the main thread running
+except KeyboardInterrupt:
+    print("Exiting...")
+    # Stop the artificial signal generator
+    if headset.is_artificial:
+        headset.stop_artificial_signal_generator()
+    # Join the thread
+    headset_server_thread.join()
+    plt.close()

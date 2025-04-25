@@ -56,6 +56,10 @@ def process_psd():
             print(f"Error in PSD processing: {e}")
             time.sleep(0.5)
 
+def normalize_psd(psd_values):
+    psd_normalized = psd_values / np.max(psd_values) if np.max(psd_values) > 0 else psd_values
+    return psd_normalized
+
 # Animation update function
 def update(frame):
     # Get all available PSD data

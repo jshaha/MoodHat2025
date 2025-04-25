@@ -13,81 +13,184 @@ import csv
 # import pylsl
 import mne
 
+
 class BCI:
-	'''
-		Class to manage collection of the BCI data and store into a buffer store. Used as the input of
-		the pipeline To receive data from the headset and store it into a list of storage queues for which
-		later blocks of the pipeline can pull from.. 
-		NOTE: This version is only set up for Muse S, using Petal Metrics' tool for handling the streaming protocol.
-		The current version works with OSC, LSL streaming is a TODO.
+    '''
+        Class to manage collection of the BCI data and store into a buffer store. Used as the input of
+        the pipeline To receive data from the headset and store it into a list of storage queues for which
+        later blocks of the pipeline can pull from.. 
+        NOTE: This version is set up for Muse S, using Petal Metrics' tool for handling the streaming protocol,
+        and also supports artificial sine wave generation for testing.
+        The current version works with OSC, LSL streaming is a TODO.
 
-		Class Variable:
-			- sampling_rate: sampling rate of the device
-			- streaming_software: software used for heandling the streaming (Petals for Muse S) (TODO: make this an option arguments)
-			- streaming_protocol: streaming protocol used by headset
-			- channel_names: list of names of channels, used for labels
-			- no_of_channels: number of channels for the device. Channels are defined as an independent stream of data that most processing blocks will treat as independent streams to compute the same operations on in parallel
-			- store: a list of queues where input data from the datastreams are added to, which later blocks can get() from
-			- time_store: single queue that holds timestamp data # TODO: make this function
-			- launch_server: function to initialize and start streaming data into self.store, determined by self.streaming_protocol
+        Class Variable:
+            - sampling_rate: sampling rate of the device
+            - streaming_software: software used for heandling the streaming (Petals for Muse S) (TODO: make this an option arguments)
+            - streaming_protocol: streaming protocol used by headset
+            - channel_names: list of names of channels, used for labels
+            - no_of_channels: number of channels for the device. Channels are defined as an independent stream of data that most processing blocks will treat as independent streams to compute the same operations on in parallel
+            - store: a list of queues where input data from the datastreams are added to, which later blocks can get() from
+            - time_store: single queue that holds timestamp data # TODO: make this function
+            - launch_server: function to initialize and start streaming data into self.store, determined by self.streaming_protocol
+            - is_artificial: boolean flag to indicate if using artificial signals instead of real BCI data
+            - artificial_signal_params: parameters for the artificial signal generation
+    '''
+    def __init__(self, BCI_name="MuseS", BCI_params={}, is_artificial=False, artificial_signal_params=None):
+        self.name = BCI_name
+        self.is_artificial = is_artificial
+        
+        if self.name == "MuseS":
+            self.BCI_params = {"sampling_rate": 256, "channel_names":["TP9", "AF7", "AF8", "TP10"], 
+                               "streaming_software":"Petals", "streaming_protocol":"OSC", "cache_size":256*30}
+            if BCI_params:
+                for i, j in BCI_params.items():  # Fixed the iteration syntax here
+                    self.BCI_params[i] = j
+        else:
+            raise Exception("Unsupported BCI board") # change this when adding other headsets
+        
+        self.sampling_rate = self.BCI_params["sampling_rate"]
+        self.streaming_software = self.BCI_params["streaming_software"] # # TODO: add as optional argument
+        self.streaming_protocol = self.BCI_params["streaming_protocol"] # TODO: mandatory argument, add error handling
+        self.channel_names = self.BCI_params["channel_names"] # TODO: add error handling -> warning for non standard channel names
+        self.no_of_channels = len(self.channel_names) # TODO: add error handling
+        self.store = [queue.Queue() for i in range(self.no_of_channels)]
+        self.time_store = queue.Queue()
+        
+        # Default artificial signal parameters if none provided
+        if artificial_signal_params is None and is_artificial:
+            self.artificial_signal_params = {
+                "frequencies": [10.0, 12.0, 15.0, 8.0],  # Hz - different freq for each channel
+                "amplitudes": [10.0, 15.0, 10.0, 12.0],  # µV - different amplitude for each channel
+                "noise_level": 2.0,  # µV - background noise level
+                "dc_offset": [0.0, 0.0, 0.0, 0.0]  # DC offset for each channel
+            }
+        else:
+            self.artificial_signal_params = artificial_signal_params
+            
+        if self.streaming_protocol == 'LSL' and not is_artificial:
+            self.launch_server = self.launch_server_lsl
+        elif self.streaming_protocol == 'OSC' and not is_artificial:
+            self.launch_server = self.launch_server_osc
+        elif is_artificial:
+            self.launch_server = self.launch_artificial_signal_generator
+        
+        # Time tracking for artificial signal generation
+        self.start_time = 0
+        self.current_sample = 0
+        self.artificial_thread = None
+        self.stop_flag = False
 
-	'''
-	def __init__(self, BCI_name="MuseS", BCI_params={}):
-		self.name = BCI_name
-		if self.name == "MuseS":
-			self.BCI_params = {"sampling_rate": 256, "channel_names":["TP9", "AF7", "AF8", "TP10"], "streaming_software":"Petals", "streaming_protocol":"OSC", "cache_size":256*30}
-			if BCI_params:
-				for i,j in BCI_params:
-					self.BCI_params[i] = j
-		else:
-			raise Exception("Unsupported BCI board") # change this when adding other headsets
-		
-		self.sampling_rate = self.BCI_params["sampling_rate"]
-		self.streaming_software = self.BCI_params["streaming_software"] # # TODO: add as optional argument
-		self.streaming_protocol = self.BCI_params["streaming_protocol"] # TODO: mandatory argument, add error handling
-		self.channel_names = self.BCI_params["channel_names"] # TODO: add error handling -> warning for non standard channel names
-		self.no_of_channels = len(self.channel_names) # TODO: add error handling
-		self.store = [queue.Queue() for i in range(self.no_of_channels)]
-		self.time_store = queue.Queue()
-		if self.streaming_protocol == 'LSL':
-			self.launch_server = self.launch_server_lsl
-		elif self.streaming_protocol == 'OSC':
-			self.launch_server = self.launch_server_osc
-		
+    def action(self):
+        pass # not required for BCI object
 
-	def action(self):
-		pass # not required for BCI object
+    def handle_osc_message(self, address, *args):
+        '''
+        Receives messages through the OSC channel and adds them to a list of queues.
+        ''' 
+        self.store[0].put(args[5])
+        self.store[1].put(args[6])
+        self.store[2].put(args[7])
+        self.store[3].put(args[8])
+        self.time_store.put(args[3] + args[4])
 
-	def handle_osc_message(self, address, *args):
-		'''
-		Receives messages through the OSC channel and adds them to a list of queues.
-		''' 
-		self.store[0].put(args[5])
-		self.store[1].put(args[6])
-		self.store[2].put(args[7])
-		self.store[3].put(args[8])
-		self.time_store.put(args[3] + args[4])
+    def launch_server_osc(self):
+        parser = argparse.ArgumentParser()
+        parser.add_argument('-i', '--ip', type=str, required=False,
+                            default="127.0.0.1", help="The ip to listen on")
+        parser.add_argument('-p', '--udp_port', type=str, required=False, default=14739,
+                            help="The UDP port to listen on")
+        parser.add_argument('-t', '--topic', type=str, required=False,
+                            default='/PetalStream/eeg', help="The topic to print")
+        args = parser.parse_args()
 
-	def launch_server_osc(self):
-		parser = argparse.ArgumentParser()
-		parser.add_argument('-i', '--ip', type=str, required=False,
-							default="127.0.0.1", help="The ip to listen on")
-		parser.add_argument('-p', '--udp_port', type=str, required=False, default=14739,
-							help="The UDP port to listen on")
-		parser.add_argument('-t', '--topic', type=str, required=False,
-							default='/PetalStream/eeg', help="The topic to print")
-		args = parser.parse_args()
+        dispatcher = disp.Dispatcher()
+        dispatcher.map(args.topic, self.handle_osc_message)
 
-		dispatcher = disp.Dispatcher()
-		dispatcher.map(args.topic, self.handle_osc_message)
+        server = osc_server.ThreadingOSCUDPServer((args.ip, args.udp_port), dispatcher)
+        server_thread = threading.Thread(target=server.serve_forever)
+        server_thread.daemon = True
+        server_thread.start()
 
-		server = osc_server.ThreadingOSCUDPServer((args.ip, args.udp_port), dispatcher)
-		server_thread = threading.Thread(target=server.serve_forever)
-		server_thread.daemon = True
-		server_thread.start()
-
-		return server, server_thread
-	
+        return server, server_thread
+        
+    def generate_artificial_samples(self):
+        """
+        Generate artificial sine wave samples with optional noise and DC offset
+        """
+        t = self.current_sample / self.sampling_rate
+        samples = []
+        
+        for i in range(self.no_of_channels):
+            # Generate sine wave for this channel with the specified frequency and amplitude
+            freq = self.artificial_signal_params["frequencies"][i]
+            amp = self.artificial_signal_params["amplitudes"][i]
+            dc = self.artificial_signal_params["dc_offset"][i]
+            
+            # Calculate the sine wave value at this time point
+            sine_val = amp * np.sin(2 * np.pi * freq * t)
+            
+            # Add random noise
+            if "noise_level" in self.artificial_signal_params:
+                noise = np.random.normal(0, self.artificial_signal_params["noise_level"])
+                sine_val += noise
+                
+            # Add DC offset
+            sine_val += dc
+            
+            samples.append(sine_val)
+            print("samples:", samples)
+        return samples
+    
+    def artificial_signal_loop(self):
+        """
+        Main loop for generating artificial signals at the appropriate sampling rate
+        """
+        self.start_time = time.time()
+        self.current_sample = 0
+        
+        while not self.stop_flag:
+            # Calculate the expected time for this sample
+            expected_time = self.start_time + (self.current_sample / self.sampling_rate)
+            
+            # Generate the sample
+            samples = self.generate_artificial_samples()
+            
+            # Add samples to the queues
+            for i, sample in enumerate(samples):
+                self.store[i].put(sample)
+            
+            # Add timestamp to time_store
+            current_time = time.time()
+            self.time_store.put(current_time)
+            
+            # Increment the sample counter
+            self.current_sample += 1
+            
+            # Sleep until it's time for the next sample
+            next_sample_time = self.start_time + ((self.current_sample) / self.sampling_rate)
+            sleep_time = max(0, next_sample_time - time.time())
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+    
+    def launch_artificial_signal_generator(self):
+        """
+        Start the artificial signal generator thread
+        """
+        self.stop_flag = False
+        self.artificial_thread = threading.Thread(target=self.artificial_signal_loop)
+        self.artificial_thread.daemon = True
+        self.artificial_thread.start()
+        
+        return None, self.artificial_thread
+    
+    def stop_artificial_signal_generator(self):
+        """
+        Stop the artificial signal generator
+        """
+        if self.artificial_thread:
+            self.stop_flag = True
+            self.artificial_thread.join(timeout=1.0)
+            self.artificial_thread = None
 	# def launch_server_lsl(self):
 	# 	'''
 	# 	Receives messages through the OSC channel and adds them to a list of queues.
@@ -287,6 +390,7 @@ class ReorderingBlock(ProcessingBlock):
             except Exception as e:
                 print(f"Error in {self.name}: {e}")
                 time.sleep(0.1)
+                
 class MovingAverageFilter(ProcessingBlock):
     """
     Calculates moving average for each channel independently.
@@ -500,7 +604,7 @@ class PSDProcessor(ProcessingBlock):
         self.step_size = int(self.window_size * (1 - self.overlap))
         if self.step_size < 1:
             self.step_size = 1
-            
+	
         # Define frequency bands of interest for emotion detection
         self.bands = {
             'delta': (1, 4),    # Deep sleep, unconsciousness
@@ -524,35 +628,84 @@ class PSDProcessor(ProcessingBlock):
         print(f"{self.name} thread started...")
         while True:
             try:
+                new_data_processed = False
+
+                # Process each channel independently
+                for channel_idx in range(self.no_of_input_channels):
+                    # Get new data point
+                    if not self.input_store[channel_idx].empty():
+                        value = self.input_store[channel_idx].get()
+                        
+                        # Add to buffer
+                        buffer = self.buffers[channel_idx]
+                        buffer.append(value)
+                        
+                        # If buffer has enough samples, calculate PSD
+                        if len(buffer) >= self.window_size:
+                            # Get window of data
+                            data_window = np.array(buffer)
+                            
+                            # Use scipy.signal.welch to calculate PSD
+                            freqs, psd_values = signal.welch(
+                                data_window, 
+                                fs=self.sampling_frequency,
+                                window='hann',
+                                nperseg=self.window_size,
+                                noverlap=int(self.window_size * self.overlap),
+                                scaling='density'
+                            )
+                            print(f"Frequency range: {min(freqs)}-{max(freqs)} Hz, Max power: {max(psd_values)}")
+                            
+                            # Put the raw PSD result in its output queue
+                            self.psd_store[channel_idx].put((freqs, psd_values))
+                            
+                            # Remove oldest value to maintain sliding window
+                            buffer.pop(0)
+                            new_data_processed = True
+                
+                # Small delay to prevent CPU hogging
+                time.sleep(0.01)
+                
+            except Exception as e:
+                print(f"Error in {self.name}: {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(0.1)
+           
+		        
+class bandPower(ProcessingBlock):
+    def __init__(self, no_of_channels, psd_store):
+        self.no_of_channels = no_of_channels
+        self.psd_store = psd_store  # List of queues containing (freqs, psd_values) tuples
+        self.name = "BandPower_" + generate_random_string()
+        
+        # Define frequency bands of interest for emotion detection
+        self.bands = {
+            'delta': (1, 4),    # Deep sleep, unconsciousness
+            'theta': (4, 8),    # Drowsiness, meditation
+            'alpha': (8, 13),   # Relaxation, calmness
+            'beta': (13, 30),   # Active thinking, focus
+            'gamma': (30, 45)   # Higher processing
+        }
+        
+        # Create output queue for band powers - will contain dictionaries
+        self.band_power_store = queue.Queue()
+        
+    def action(self):
+        """Process PSD data to calculate band powers."""
+        print(f"{self.name} thread started...")
+        while True:
+            try:
                 # Dictionary to hold band powers for all channels
                 all_band_powers = {}
                 new_data_processed = False
-                
+
                 # Process each channel independently
-                for channel_idx in range(self.no_of_input_channels):
-                    # Get new data points until we have enough or queue is empty
-                    while (len(self.buffers[channel_idx]) < self.window_size and 
-                           not self.input_store[channel_idx].empty()):
-                        value = self.input_store[channel_idx].get()
-                        self.buffers[channel_idx].append(value)
-	
-                    # If buffer has enough samples, calculate PSD
-                    if len(self.buffers[channel_idx]) >= self.window_size:
-                        # Get window of data
-                        data_window = np.array(self.buffers[channel_idx][:self.window_size])
-                        
-                        # Use scipy.signal.welch to calculate PSD
-                        freqs, psd_values = signal.welch(
-                            data_window, 
-                            fs=self.sampling_frequency,
-                            window='hann',
-                            nperseg=self.window_size,
-                            noverlap=int(self.window_size * self.overlap),
-                            scaling='density'
-                        )
-                        
-                        # Put the raw PSD result in its output queue
-                        self.psd_store[channel_idx].put((freqs, psd_values))
+                for channel_idx in range(self.no_of_channels):
+                    # Check if there's new PSD data
+                    if not self.psd_store[channel_idx].empty():
+                        # Get PSD data
+                        freqs, psd_values = self.psd_store[channel_idx].get()
                         
                         # Calculate band powers
                         for band_name, (fmin, fmax) in self.bands.items():
@@ -569,8 +722,6 @@ class PSDProcessor(ProcessingBlock):
                             feature_name = f"channel_{channel_idx}_{band_name}"
                             all_band_powers[feature_name] = power
                         
-                        # Remove oldest samples based on step size
-                        self.buffers[channel_idx] = self.buffers[channel_idx][self.step_size:]
                         new_data_processed = True
                 
                 # If we have new data for any channel, output the band powers
